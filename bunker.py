@@ -964,25 +964,41 @@ def render_week_view(user_id: str, tracker_id: int, tracker_start: date, tracker
     return sessions
 
 
-def render_prompts_for_today(week_sessions: List[sqlite3.Row]):
-    st.subheader("Today — attendance prompts")
+def render_prompts_for_pending(week_sessions: List[sqlite3.Row]):
+    st.subheader("Attendance prompts")
 
     now = datetime.now(IST)
-    today_iso = date.today().isoformat()
+    today = date.today()
     prompted = False
 
-    for s in week_sessions:
-        if s["session_date"] != today_iso or s["status"] != "PENDING":
+    # Sort by date, then end time (oldest first)
+    ordered = sorted(
+        week_sessions,
+        key=lambda s: (s["session_date"], s["end_time"])
+    )
+
+    for s in ordered:
+        if s["status"] != "PENDING":
             continue
+
+        session_day = date.fromisoformat(s["session_date"])
+        if session_day > today:
+            continue  # future session
 
         end_time = datetime.strptime(s["end_time"], "%H:%M").time()
-        end_dt = datetime.combine(date.today(), end_time, tzinfo=IST) + timedelta(minutes=POST_CLASS_BUFFER_MIN)
+        end_dt = datetime.combine(session_day, end_time, tzinfo=IST) \
+                 + timedelta(minutes=POST_CLASS_BUFFER_MIN)
 
         if now < end_dt:
-            continue
+            continue  # class not finished yet
 
         prompted = True
-        st.write(f"**{s['subject']}** ({s['start_time']}–{s['end_time']})")
+
+        st.write(
+            f"**{s['subject']}** "
+            f"({session_day.strftime('%d %b')} · {s['start_time']}–{s['end_time']})"
+        )
+
         a, b, c = st.columns(3)
         if a.button("✅ Attended", key=f"att_{s['session_id']}"):
             set_status(int(s["session_id"]), "ATTENDED")
@@ -993,10 +1009,12 @@ def render_prompts_for_today(week_sessions: List[sqlite3.Row]):
         if c.button("❌ Missed", key=f"mis_{s['session_id']}"):
             set_status(int(s["session_id"]), "MISSED")
             st.rerun()
+
         st.markdown("---")
 
     if not prompted:
-        st.caption("No pending prompts right now (shown after end time + buffer).")
+        st.caption("No pending attendance prompts right now.")
+
 
 
 def sidebar_editor(tracker_id: int, readonly: bool):
@@ -1211,4 +1229,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
