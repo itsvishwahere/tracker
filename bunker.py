@@ -119,7 +119,21 @@ def init_db():
                 tracker_id INTEGER NOT NULL
             );
             """
-        )
+        )      
+        
+        
+        # ---- users table migration (schema drift fix) ----
+        if not _has_column(c, "users", "username_display"):
+            c.execute("ALTER TABLE users ADD COLUMN username_display TEXT")
+
+        # Backfill display name for existing users
+        c.execute("""
+            UPDATE users
+            SET username_display = username_lower
+            WHERE username_display IS NULL
+        """)
+
+        
 
         # Trackers migration fields
         if not _has_column(c, "trackers", "is_global"):
@@ -1399,3 +1413,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
