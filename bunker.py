@@ -1,39 +1,53 @@
 # attendance_app.py
 # Streamlit 1.52.2 compatible
-# Single DB: attendance.db
-# FULL FEATURE VERSION (same UI/UX as your large prototype)
-# FIXES:
-#   (1) IST timezone-safe prompts (Streamlit Cloud runs UTC)
-#   (2) Clone-once-per-user guard (cloned_from + unique index)
-#   (3) Clone occurs ONLY on "Open" click, never inside tracker_page reruns
+# DB: attendance.db
 #
-# Behavior:
-#   - One GLOBAL tracker ("Sem 6 - NITT EEE B") visible to all users
-#   - When user clicks Open on GLOBAL, they get (or reuse) their personal clone
-#   - Attendance sessions/prompts are per user (clones have fresh sessions)
+# Correct multi-user model:
+#   - Timetable (trackers + classes) can be GLOBAL or user-owned
+#   - Attendance sessions are ALWAYS per-user:
+#       UNIQUE(user_id, class_id, session_date)
+#   - GLOBAL timetable is read-only; users can "Fork" it to edit
+#   - Each user starts with fresh attendance states (PENDING) even on GLOBAL timetable
+#   - Same user re-entry must remember their attendance -> handled via persistent user key
+#
+# Identity:
+#   - No auth. App uses a user_id token.
+#   - User can paste an existing token (for re-entry) or generate a new one.
+#   - Token is stored in query params (?uid=...) for persistence (bookmark link).
+#
+# Includes:
+#   - Landing page with FAB create tracker
+#   - Tracker page with Summary (course-wise dashboard) and Tasks (week view + prompts)
+#   - End-aligned compressed week layout (your blob layout)
+#   - Sidebar editor with add/edit/delete + undo + danger zone (disabled for GLOBAL)
+#
+# NOTE: For true seamless re-entry without bookmarking, you'd need cookies/auth.
+# This version makes persistence explicit and reliable via uid in URL.
 
 import sqlite3
-from datetime import datetime, date, timedelta, timezone
-from typing import Dict, List, Tuple, Optional
 import uuid
+from datetime import datetime, date, timedelta, timezone
+from typing import Dict, List, Optional
 
 import streamlit as st
 
 DB = "attendance.db"
-POST_CLASS_BUFFER_MIN = 5  # prompt after end time + buffer
-GLOBAL_DEFAULT_TRACKER_NAME = "Sem 6 - NITT EEE B"
+POST_CLASS_BUFFER_MIN = 5
+GLOBAL_TRACKER_NAME = "Sem 6 - NITT EEE B"
 
-# IST (no external deps)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 DAY_TO_INT = {d: i for i, d in enumerate(DAYS)}
 
-# -------------------- USER ID (temporary, per browser session) --------------------
-def ensure_user_id() -> str:
-    if "user_id" not in st.session_state:
-        st.session_state.user_id = str(uuid.uuid4())
-    return st.session_state.user_id
+TRACKER_PALETTE = [
+    "#1abc9c", "#3498db", "#9b59b6", "#e67e22", "#e84393",
+    "#16a085", "#2980b9", "#8e44ad", "#c0392b", "#2c3e50",
+]
+COURSE_PALETTE = [
+    "#2ecc71", "#e74c3c", "#f1c40f", "#9b59b6", "#3498db",
+    "#1abc9c", "#e67e22", "#34495e", "#d35400", "#8e44ad",
+]
 
 
 # -------------------- DB --------------------
@@ -43,25 +57,50 @@ def conn():
     return c
 
 
-def _table_has_column(c: sqlite3.Connection, table: str, col: str) -> bool:
+def _has_column(c: sqlite3.Connection, table: str, col: str) -> bool:
     rows = c.execute(f"PRAGMA table_info({table})").fetchall()
     return any(r["name"] == col for r in rows)
 
 
+def _table_exists(c: sqlite3.Connection, table: str) -> bool:
+    r = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,)).fetchone()
+    return r is not None
+
+
 def init_db():
     """
-    Base schema + migrations:
-      - trackers.user_id (TEXT)         : owner for user trackers; NULL for GLOBAL
-      - trackers.is_default (INTEGER)   : 1 for GLOBAL tracker
-      - trackers.cloned_from (INTEGER)  : if user tracker is a clone of a GLOBAL tracker
-      - unique index on (user_id, cloned_from) where cloned_from not null (prevents duplicates)
-    Also:
-      - ensures exactly one GLOBAL tracker exists and is named GLOBAL_DEFAULT_TRACKER_NAME
-      - promotes existing first tracker to global if needed (your local DB migration behavior)
+    Creates schema + migrates older DBs safely.
+
+    Key schema:
+      trackers:
+        - is_global (0/1)
+        - owner_user_id (NULL for GLOBAL)
+      classes:
+        - linked to tracker
+      sessions (v2):
+        - user_id NOT NULL
+        - UNIQUE(user_id, class_id, session_date)
+
+    Migration strategy:
+      - If old sessions table lacks user_id or has old unique constraint:
+          rename old sessions -> sessions_old
+          create new sessions with user_id
+          copy old data assigning to OWNER user_id in app_meta
     """
     with conn() as c:
+        # Base tables (trackers/classes) if missing
         c.executescript(
             """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                display_name TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS trackers (
                 tracker_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -78,90 +117,204 @@ def init_db():
                 end_time TEXT NOT NULL,
                 tracker_id INTEGER NOT NULL
             );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                class_id INTEGER NOT NULL,
-                session_date TEXT NOT NULL,
-                status TEXT CHECK(status IN ('PENDING','ATTENDED','MISSED','CANCELLED')) NOT NULL,
-                UNIQUE(class_id, session_date)
-            );
             """
         )
 
-        # Migrate columns
-        if not _table_has_column(c, "trackers", "user_id"):
-            c.execute("ALTER TABLE trackers ADD COLUMN user_id TEXT")
-        if not _table_has_column(c, "trackers", "is_default"):
-            c.execute("ALTER TABLE trackers ADD COLUMN is_default INTEGER DEFAULT 0")
-        if not _table_has_column(c, "trackers", "cloned_from"):
-            c.execute("ALTER TABLE trackers ADD COLUMN cloned_from INTEGER")
+        # Migrate tracker ownership/global flags
+        if not _has_column(c, "trackers", "is_global"):
+            c.execute("ALTER TABLE trackers ADD COLUMN is_global INTEGER DEFAULT 0")
+        if not _has_column(c, "trackers", "owner_user_id"):
+            c.execute("ALTER TABLE trackers ADD COLUMN owner_user_id TEXT")
 
-        # Prevent multiple GLOBAL defaults
-        defaults = c.execute(
-            "SELECT tracker_id FROM trackers WHERE is_default=1 ORDER BY tracker_id"
-        ).fetchall()
-        if len(defaults) > 1:
-            keep = int(defaults[0]["tracker_id"])
-            c.execute("UPDATE trackers SET is_default=0 WHERE is_default=1 AND tracker_id<>?", (keep,))
+        # Determine/ensure OWNER user id for legacy sessions
+        owner = c.execute("SELECT value FROM app_meta WHERE key='owner_user_id'").fetchone()
+        if owner is None:
+            # Stable owner id; you can change later by updating app_meta
+            c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('owner_user_id','OWNER')")
+            owner_user_id = "OWNER"
+        else:
+            owner_user_id = owner["value"]
 
-        # Create unique index for clone guard (best-effort; partial index supported on modern SQLite)
-        try:
-            c.execute(
+        # Ensure sessions table exists and is v2
+        if not _table_exists(c, "sessions"):
+            c.executescript(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_clone_per_user
-                ON trackers(user_id, cloned_from)
-                WHERE cloned_from IS NOT NULL
+                CREATE TABLE sessions (
+                    session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    class_id INTEGER NOT NULL,
+                    session_date TEXT NOT NULL,
+                    status TEXT CHECK(status IN ('PENDING','ATTENDED','MISSED','CANCELLED')) NOT NULL,
+                    UNIQUE(user_id, class_id, session_date)
+                );
                 """
             )
-        except Exception:
-            # If the environment SQLite is too old for partial indexes,
-            # we still guard at application level.
-            pass
+        else:
+            # Check if current sessions schema matches v2 (has user_id and correct uniqueness)
+            has_user_id = _has_column(c, "sessions", "user_id")
+            if not has_user_id:
+                # Legacy sessions v1: (session_id, class_id, session_date, status, UNIQUE(class_id, session_date))
+                c.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+                c.execute("UPDATE sessions SET user_id=? WHERE user_id IS NULL OR user_id=''", (owner_user_id,))
+                # But uniqueness is still wrong. We must rebuild table.
+                c.execute("ALTER TABLE sessions RENAME TO sessions_old")
 
-        # Ensure a GLOBAL default exists, and enforce its name and ownership = NULL
-        default = c.execute(
-            "SELECT * FROM trackers WHERE is_default=1 ORDER BY tracker_id LIMIT 1"
-        ).fetchone()
-
-        if default is None:
-            candidate = c.execute("SELECT * FROM trackers ORDER BY tracker_id LIMIT 1").fetchone()
-            if candidate is None:
-                # Fresh install
+                c.executescript(
+                    """
+                    CREATE TABLE sessions (
+                        session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        class_id INTEGER NOT NULL,
+                        session_date TEXT NOT NULL,
+                        status TEXT CHECK(status IN ('PENDING','ATTENDED','MISSED','CANCELLED')) NOT NULL,
+                        UNIQUE(user_id, class_id, session_date)
+                    );
+                    """
+                )
                 c.execute(
                     """
-                    INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default, cloned_from)
-                    VALUES (?,?,?,?,NULL,1,NULL)
+                    INSERT INTO sessions(session_id, user_id, class_id, session_date, status)
+                    SELECT session_id, user_id, class_id, session_date, status
+                    FROM sessions_old
+                    """
+                )
+                c.execute("DROP TABLE sessions_old")
+            else:
+                # Might still be old uniqueness. Ensure a unique index exists for v2 (best effort).
+                try:
+                    c.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_u_c_d
+                        ON sessions(user_id, class_id, session_date)
+                        """
+                    )
+                except Exception:
+                    pass
+
+        # Ensure exactly one GLOBAL tracker exists and is named properly
+        global_t = c.execute("SELECT * FROM trackers WHERE is_global=1 ORDER BY tracker_id LIMIT 1").fetchone()
+        if global_t is None:
+            # Promote first tracker if exists, else create new
+            first = c.execute("SELECT * FROM trackers ORDER BY tracker_id LIMIT 1").fetchone()
+            if first is None:
+                c.execute(
+                    """
+                    INSERT INTO trackers(name, created_at, start_date, end_date, is_global, owner_user_id)
+                    VALUES (?,?,?,?,1,NULL)
                     """,
                     (
-                        GLOBAL_DEFAULT_TRACKER_NAME,
+                        GLOBAL_TRACKER_NAME,
                         datetime.now(IST).isoformat(timespec="seconds"),
                         date.today().isoformat(),
                         (date.today() + timedelta(days=150)).isoformat(),
                     ),
                 )
             else:
-                # Promote your existing local prototype tracker to GLOBAL
                 c.execute(
                     """
                     UPDATE trackers
-                    SET name=?, is_default=1, user_id=NULL, cloned_from=NULL
+                    SET name=?, is_global=1, owner_user_id=NULL
                     WHERE tracker_id=?
                     """,
-                    (GLOBAL_DEFAULT_TRACKER_NAME, int(candidate["tracker_id"])),
+                    (GLOBAL_TRACKER_NAME, int(first["tracker_id"])),
                 )
         else:
-            # Enforce canonical global tracker properties
             c.execute(
                 """
                 UPDATE trackers
-                SET name=?, is_default=1, user_id=NULL, cloned_from=NULL
+                SET name=?, is_global=1, owner_user_id=NULL
                 WHERE tracker_id=?
                 """,
-                (GLOBAL_DEFAULT_TRACKER_NAME, int(default["tracker_id"])),
+                (GLOBAL_TRACKER_NAME, int(global_t["tracker_id"])),
             )
 
+        # If multiple globals exist due to past bugs, demote extras
+        globals_all = c.execute("SELECT tracker_id FROM trackers WHERE is_global=1 ORDER BY tracker_id").fetchall()
+        if len(globals_all) > 1:
+            keep = int(globals_all[0]["tracker_id"])
+            c.execute("UPDATE trackers SET is_global=0 WHERE is_global=1 AND tracker_id<>?", (keep,))
+
         c.commit()
+
+
+# -------------------- Identity via URL token --------------------
+def get_query_params() -> Dict[str, List[str]]:
+    try:
+        qp = dict(st.query_params)
+        out: Dict[str, List[str]] = {}
+        for k, v in qp.items():
+            if isinstance(v, list):
+                out[k] = v
+            else:
+                out[k] = [str(v)]
+        return out
+    except Exception:
+        return st.experimental_get_query_params()
+
+
+def set_query_params(**kwargs):
+    try:
+        st.query_params.clear()
+        for k, v in kwargs.items():
+            st.query_params[k] = v
+    except Exception:
+        st.experimental_set_query_params(**kwargs)
+
+
+def ensure_user() -> str:
+    """
+    Persist user across re-entry using uid query param (?uid=...).
+    If absent, ask user to create/enter one. This is required for "remember my attendance".
+    """
+    qp = get_query_params()
+    uid = None
+    if "uid" in qp and qp["uid"]:
+        uid = qp["uid"][0].strip() or None
+
+    if "user_id" in st.session_state and st.session_state.user_id:
+        # If session already has it, prefer that.
+        return st.session_state.user_id
+
+    if uid:
+        st.session_state.user_id = uid
+        with conn() as c:
+            c.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (uid,))
+        return uid
+
+    # No uid -> show gate
+    st.title("Attendance Trackers")
+    st.info("To remember your attendance across re-entry, you need a User Token (uid). Bookmark your link after setting it.")
+
+    with st.form("user_token_form"):
+        existing = st.text_input("Enter your existing uid (if you have one)")
+        name = st.text_input("Display name (optional)")
+        col1, col2 = st.columns(2)
+        use_existing = col1.form_submit_button("Use this uid", type="primary")
+        gen_new = col2.form_submit_button("Generate new uid")
+
+        if use_existing:
+            x = (existing or "").strip()
+            if not x:
+                st.error("uid cannot be empty.")
+                st.stop()
+            st.session_state.user_id = x
+            with conn() as c:
+                c.execute("INSERT OR IGNORE INTO users(user_id, display_name) VALUES (?,?)", (x, (name or "").strip() or None))
+                if name.strip():
+                    c.execute("UPDATE users SET display_name=? WHERE user_id=?", (name.strip(), x))
+            set_query_params(uid=x)
+            st.rerun()
+
+        if gen_new:
+            x = str(uuid.uuid4())
+            st.session_state.user_id = x
+            with conn() as c:
+                c.execute("INSERT OR IGNORE INTO users(user_id, display_name) VALUES (?,?)", (x, (name or "").strip() or None))
+            set_query_params(uid=x)
+            st.success("uid generated. Bookmark this page now (URL contains your uid).")
+            st.rerun()
+
+    st.stop()
 
 
 # -------------------- Helpers --------------------
@@ -171,9 +324,6 @@ def parse_time_to_minutes(hhmm: str) -> int:
 
 
 def normalize_time(hhmm: str) -> str:
-    """
-    Normalizes '9:20' -> '09:20' to prevent slot-key mismatch and layout drift.
-    """
     t = datetime.strptime(hhmm.strip(), "%H:%M").time()
     return f"{t.hour:02d}:{t.minute:02d}"
 
@@ -203,17 +353,6 @@ def clamp_week_offset(week_offset: int, tracker_start: date, tracker_end: date) 
     if target > latest:
         return (latest - base).days // 7
     return week_offset
-
-
-# -------------------- Colors --------------------
-TRACKER_PALETTE = [
-    "#1abc9c", "#3498db", "#9b59b6", "#e67e22", "#e84393",
-    "#16a085", "#2980b9", "#8e44ad", "#c0392b", "#2c3e50",
-]
-COURSE_PALETTE = [
-    "#2ecc71", "#e74c3c", "#f1c40f", "#9b59b6", "#3498db",
-    "#1abc9c", "#e67e22", "#34495e", "#d35400", "#8e44ad",
-]
 
 
 def stable_color(seed: str, palette: List[str]) -> str:
@@ -259,13 +398,7 @@ def inject_css():
           }
 
           .dayhead { font-weight: 900; margin-bottom: 10px; }
-
-          .time-axis {
-            font-size: 0.82rem;
-            opacity: 0.70;
-            padding-top: 8px;
-            white-space: nowrap;
-          }
+          .time-axis { font-size: 0.82rem; opacity: 0.70; padding-top: 8px; white-space: nowrap; }
 
           .day-box {
             border: 1px solid rgba(255,255,255,0.10);
@@ -275,12 +408,7 @@ def inject_css():
             background: rgba(255,255,255,0.02);
           }
 
-          .band-cell {
-            display: flex;
-            flex-direction: column;
-            justify-content: flex-end;
-            gap: 10px;
-          }
+          .band-cell { display: flex; flex-direction: column; justify-content: flex-end; gap: 10px; }
 
           .course-pill {
             border-radius: 14px;
@@ -293,20 +421,10 @@ def inject_css():
             flex-direction: column;
             justify-content: space-between;
           }
-          .pill-meta {
-            font-weight: 650;
-            font-size: 0.82rem;
-            opacity: 0.95;
-            margin-top: 4px;
-          }
+          .pill-meta { font-weight: 650; font-size: 0.82rem; opacity: 0.95; margin-top: 4px; }
           .pill-status {
-            margin-top: 10px;
-            font-size: 0.76rem;
-            padding: 1px 10px;
-            border-radius: 999px;
-            background: rgba(0,0,0,0.18);
-            display: inline-block;
-            width: fit-content;
+            margin-top: 10px; font-size: 0.76rem; padding: 1px 10px; border-radius: 999px;
+            background: rgba(0,0,0,0.18); display: inline-block; width: fit-content;
           }
 
           .range-note { opacity: 0.75; font-size: 0.90rem; }
@@ -316,72 +434,73 @@ def inject_css():
     )
 
 
-# -------------------- Query param helpers (FAB) --------------------
-def get_query_params() -> Dict[str, List[str]]:
-    try:
-        qp = dict(st.query_params)
-        out: Dict[str, List[str]] = {}
-        for k, v in qp.items():
-            if isinstance(v, list):
-                out[k] = v
-            else:
-                out[k] = [str(v)]
-        return out
-    except Exception:
-        return st.experimental_get_query_params()
-
-
-def set_query_params(**kwargs):
-    try:
-        st.query_params.clear()
-        for k, v in kwargs.items():
-            st.query_params[k] = v
-    except Exception:
-        st.experimental_set_query_params(**kwargs)
-
-
 # -------------------- Data access --------------------
-def trackers(user_id: str):
-    """
-    Return GLOBAL + user-owned trackers.
-    """
+def list_trackers_for_user(user_id: str):
     with conn() as c:
         return c.execute(
             """
             SELECT * FROM trackers
-            WHERE is_default=1 OR user_id=?
-            ORDER BY is_default DESC, tracker_id
+            WHERE is_global=1 OR owner_user_id=?
+            ORDER BY is_global DESC, tracker_id
             """,
             (user_id,),
         ).fetchall()
 
 
-def get_tracker(tracker_id: int, user_id: str):
-    """
-    Enforce access control: can only read GLOBAL or own trackers.
-    """
+def get_tracker(tracker_id: int):
     with conn() as c:
-        return c.execute(
-            """
-            SELECT * FROM trackers
-            WHERE tracker_id=? AND (is_default=1 OR user_id=?)
-            """,
-            (tracker_id, user_id),
-        ).fetchone()
+        return c.execute("SELECT * FROM trackers WHERE tracker_id=?", (tracker_id,)).fetchone()
 
 
-def create_tracker(name: str, start_date: date, end_date: date, user_id: str):
+def is_tracker_global(tracker_id: int) -> bool:
+    t = get_tracker(tracker_id)
+    return bool(t) and int(t["is_global"] or 0) == 1
+
+
+def create_tracker(name: str, start_date: date, end_date: date, owner_user_id: str):
     name = (name or "").strip() or "Untitled Tracker"
     if end_date < start_date:
         raise ValueError("End date must be on/after start date.")
     with conn() as c:
         c.execute(
             """
-            INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default, cloned_from)
-            VALUES (?,?,?,?,?,0,NULL)
+            INSERT INTO trackers(name, created_at, start_date, end_date, is_global, owner_user_id)
+            VALUES (?,?,?,?,0,?)
             """,
-            (name, datetime.now(IST).isoformat(timespec="seconds"), start_date.isoformat(), end_date.isoformat(), user_id),
+            (name, datetime.now(IST).isoformat(timespec="seconds"), start_date.isoformat(), end_date.isoformat(), owner_user_id),
         )
+
+
+def fork_tracker(source_tracker_id: int, owner_user_id: str) -> int:
+    """
+    Creates a user-owned copy of the timetable (classes). Attendance sessions are NOT copied.
+    """
+    src = get_tracker(source_tracker_id)
+    if not src:
+        raise ValueError("Source tracker not found.")
+
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO trackers(name, created_at, start_date, end_date, is_global, owner_user_id)
+            VALUES (?,?,?,?,0,?)
+            """,
+            (src["name"], datetime.now(IST).isoformat(timespec="seconds"), src["start_date"], src["end_date"], owner_user_id),
+        )
+        new_tid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+        classes = c.execute(
+            "SELECT subject, day_of_week, start_time, end_time FROM classes WHERE tracker_id=? ORDER BY class_id",
+            (source_tracker_id,),
+        ).fetchall()
+
+        for cl in classes:
+            c.execute(
+                "INSERT INTO classes(subject, day_of_week, start_time, end_time, tracker_id) VALUES (?,?,?,?,?)",
+                (cl["subject"], int(cl["day_of_week"]), cl["start_time"], cl["end_time"], new_tid),
+            )
+
+        return new_tid
 
 
 def list_classes(tracker_id: int):
@@ -422,7 +541,9 @@ def update_class(class_id: int, subject: str, day: int, start: str, end: str) ->
     if parse_time_to_minutes(end_n) <= parse_time_to_minutes(start_n):
         raise ValueError("End time must be after start time.")
 
-    today_iso = date.today().isoformat()
+    # NOTE: We do not delete sessions anymore because sessions are per-user.
+    # Editing a class should not wipe other users' attendance history.
+    # We keep existing sessions as historical record; new weeks will be generated with new class times.
 
     with conn() as c:
         old = c.execute(
@@ -435,12 +556,6 @@ def update_class(class_id: int, subject: str, day: int, start: str, end: str) ->
             (subject, day, start_n, end_n, class_id),
         )
 
-        # prevent duplicate future schedule sessions
-        c.execute(
-            "DELETE FROM sessions WHERE class_id=? AND status='PENDING' AND session_date>=?",
-            (class_id, today_iso),
-        )
-
     return dict(old) if old else None
 
 
@@ -450,12 +565,19 @@ def delete_class(class_id: int) -> Optional[Dict]:
             "SELECT class_id, subject, day_of_week, start_time, end_time, tracker_id FROM classes WHERE class_id=?",
             (class_id,),
         ).fetchone()
+
+        # Deleting a class should delete all sessions for all users for that class_id.
+        # This is correct because the class no longer exists.
         c.execute("DELETE FROM sessions WHERE class_id=?", (class_id,))
         c.execute("DELETE FROM classes WHERE class_id=?", (class_id,))
     return dict(old) if old else None
 
 
-def ensure_sessions_for_week(tracker_id: int, week_start: date, tracker_start: date, tracker_end: date):
+def ensure_sessions_for_week(user_id: str, tracker_id: int, week_start: date, tracker_start: date, tracker_end: date):
+    """
+    Creates (user-specific) session rows for the week as PENDING.
+    UNIQUE(user_id, class_id, session_date) prevents duplicates.
+    """
     classes = list_classes(tracker_id)
     with conn() as c:
         for cl in classes:
@@ -463,24 +585,29 @@ def ensure_sessions_for_week(tracker_id: int, week_start: date, tracker_start: d
             if d < tracker_start or d > tracker_end:
                 continue
             c.execute(
-                "INSERT OR IGNORE INTO sessions(class_id, session_date, status) VALUES (?,?, 'PENDING')",
-                (cl["class_id"], d.isoformat()),
+                """
+                INSERT OR IGNORE INTO sessions(user_id, class_id, session_date, status)
+                VALUES (?,?,?, 'PENDING')
+                """,
+                (user_id, int(cl["class_id"]), d.isoformat()),
             )
 
 
-def get_sessions_for_week(tracker_id: int, week_start: date):
+def get_sessions_for_week(user_id: str, tracker_id: int, week_start: date):
     dates = [(week_start + timedelta(days=i)).isoformat() for i in range(7)]
     with conn() as c:
         return c.execute(
             f"""
-            SELECT s.*, c.subject, c.start_time, c.end_time
+            SELECT s.session_id, s.user_id, s.class_id, s.session_date, s.status,
+                   c.subject, c.start_time, c.end_time
             FROM sessions s
             JOIN classes c ON c.class_id=s.class_id
-            WHERE c.tracker_id=?
+            WHERE s.user_id=?
+              AND c.tracker_id=?
               AND s.session_date IN ({','.join('?'*7)})
             ORDER BY s.session_date, c.start_time, c.end_time, c.subject
             """,
-            (tracker_id, *dates),
+            (user_id, tracker_id, *dates),
         ).fetchall()
 
 
@@ -489,7 +616,7 @@ def set_status(session_id: int, status: str):
         c.execute("UPDATE sessions SET status=? WHERE session_id=?", (status, session_id))
 
 
-def course_stats(tracker_id: int) -> List[Dict]:
+def course_stats(user_id: str, tracker_id: int) -> List[Dict]:
     with conn() as c:
         rows = c.execute(
             """
@@ -499,11 +626,11 @@ def course_stats(tracker_id: int) -> List[Dict]:
                    SUM(s.status='CANCELLED') AS cx
             FROM sessions s
             JOIN classes c ON c.class_id=s.class_id
-            WHERE c.tracker_id=?
+            WHERE s.user_id=? AND c.tracker_id=?
             GROUP BY c.subject
             ORDER BY c.subject
             """,
-            (tracker_id,),
+            (user_id, tracker_id),
         ).fetchall()
 
     out: List[Dict] = []
@@ -527,14 +654,13 @@ def clear_timetable(tracker_id: int):
 
 
 def delete_tracker(tracker_id: int):
+    # Deleting tracker deletes its classes and all sessions for those classes.
     clear_timetable(tracker_id)
     with conn() as c:
         c.execute("DELETE FROM trackers WHERE tracker_id=?", (tracker_id,))
 
 
 def apply_undo(action: Dict):
-    today_iso = date.today().isoformat()
-
     typ = action.get("type")
     if typ == "add":
         cid = int(action["class_id"])
@@ -550,10 +676,6 @@ def apply_undo(action: Dict):
             c.execute(
                 "UPDATE classes SET subject=?, day_of_week=?, start_time=?, end_time=? WHERE class_id=?",
                 (old.get("subject"), int(old.get("day_of_week")), old.get("start_time"), old.get("end_time"), cid),
-            )
-            c.execute(
-                "DELETE FROM sessions WHERE class_id=? AND status='PENDING' AND session_date>=?",
-                (cid, today_iso),
             )
         return
 
@@ -576,62 +698,7 @@ def apply_undo(action: Dict):
     raise ValueError(f"Unsupported undo type: {typ}")
 
 
-# -------------------- Global clone support --------------------
-def _get_default_tracker():
-    with conn() as c:
-        return c.execute("SELECT * FROM trackers WHERE is_default=1 ORDER BY tracker_id LIMIT 1").fetchone()
-
-
-def get_or_create_user_clone_of_default(user_id: str) -> int:
-    """
-    FIX: Clone-once guard
-      - if user already has a clone of the GLOBAL tracker, reuse it
-      - else create it
-    """
-    default = _get_default_tracker()
-    if not default:
-        raise RuntimeError("Global default tracker not found.")
-
-    default_id = int(default["tracker_id"])
-
-    with conn() as c:
-        existing = c.execute(
-            """
-            SELECT tracker_id FROM trackers
-            WHERE user_id=? AND cloned_from=?
-            ORDER BY tracker_id LIMIT 1
-            """,
-            (user_id, default_id),
-        ).fetchone()
-
-        if existing:
-            return int(existing["tracker_id"])
-
-        now = datetime.now(IST).isoformat(timespec="seconds")
-        c.execute(
-            """
-            INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default, cloned_from)
-            VALUES (?,?,?,?,?,0,?)
-            """,
-            (default["name"], now, default["start_date"], default["end_date"], user_id, default_id),
-        )
-        new_tid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
-
-        classes = c.execute(
-            "SELECT subject, day_of_week, start_time, end_time FROM classes WHERE tracker_id=? ORDER BY class_id",
-            (default_id,),
-        ).fetchall()
-
-        for cl in classes:
-            c.execute(
-                "INSERT INTO classes(subject, day_of_week, start_time, end_time, tracker_id) VALUES (?,?,?,?,?)",
-                (cl["subject"], int(cl["day_of_week"]), cl["start_time"], cl["end_time"], new_tid),
-            )
-
-        return new_tid
-
-
-# -------------------- UI / Pages --------------------
+# -------------------- UI Logic --------------------
 def reset_tracker_view_state():
     st.session_state.tracker_view = "summary"
     st.session_state.week_offset = 0
@@ -640,10 +707,19 @@ def reset_tracker_view_state():
     st.session_state.confirm_delete_flag = False
 
 
-def home():
-    user_id = ensure_user_id()
-
+def home(user_id: str):
     st.title("Attendance Trackers")
+
+    # Identity controls (explicit and reliable)
+    with st.sidebar:
+        st.header("User")
+        st.caption("Your uid is stored in the URL. Bookmark it for re-entry.")
+        st.code(user_id)
+        if st.button("Change uid"):
+            # Remove uid from query params to re-trigger gate
+            set_query_params(uid="")
+            st.session_state.pop("user_id", None)
+            st.rerun()
 
     st.markdown("<div class='fab'><a href='?create=1'>+</a></div>", unsafe_allow_html=True)
     qp = get_query_params()
@@ -660,17 +736,17 @@ def home():
             if c1.form_submit_button("Create", type="primary"):
                 try:
                     create_tracker(name, sd, ed, user_id)
-                    set_query_params()
+                    set_query_params(uid=user_id)  # keep uid, clear create
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
             if c2.form_submit_button("Cancel"):
-                set_query_params()
+                set_query_params(uid=user_id)
                 st.rerun()
 
         st.markdown("---")
 
-    ts = trackers(user_id)
+    ts = list_trackers_for_user(user_id)
     if not ts:
         st.info("No trackers yet. Use the + button to create one.")
         return
@@ -686,34 +762,43 @@ def home():
             idx += 1
             tid = int(t["tracker_id"])
             bg = stable_color(str(tid), TRACKER_PALETTE)
-            is_default = int(t["is_default"]) == 1
+            global_badge = "<span class='global-badge'>GLOBAL</span>" if int(t["is_global"] or 0) == 1 else ""
 
             with cols[j]:
-                badge = "<span class='global-badge'>GLOBAL</span>" if is_default else ""
                 st.markdown(
                     f"""
                     <div class='tracker-blob' style='background:{bg}'>
-                      <h4>{t['name']}{badge}</h4>
+                      <h4>{t['name']}{global_badge}</h4>
                       <div class='tracker-meta'>{t['start_date']} → {t['end_date']}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
-                if st.button("Open", key=f"open_{tid}"):
-                    # FIX: clone on click ONLY (not inside tracker_page reruns)
-                    if is_default:
-                        tid = get_or_create_user_clone_of_default(user_id)
 
+                c1, c2 = st.columns([1, 1])
+                if c1.button("Open", key=f"open_{tid}"):
                     st.session_state.page = "tracker"
                     st.session_state.active_tracker = tid
                     reset_tracker_view_state()
                     st.rerun()
 
+                # Fork option only for GLOBAL tracker
+                if int(t["is_global"] or 0) == 1:
+                    if c2.button("Fork", key=f"fork_{tid}"):
+                        try:
+                            new_tid = fork_tracker(tid, user_id)
+                            st.session_state.page = "tracker"
+                            st.session_state.active_tracker = new_tid
+                            reset_tracker_view_state()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
 
-def render_course_dashboard(tracker_id: int):
-    stats = course_stats(tracker_id)
+
+def render_course_dashboard(user_id: str, tracker_id: int):
+    stats = course_stats(user_id, tracker_id)
     if not stats:
-        st.info("No attendance data yet for this tracker.")
+        st.info("No attendance data yet for this tracker (for you).")
         return
 
     try:
@@ -741,7 +826,7 @@ def render_course_dashboard(tracker_id: int):
                         )
                     )
                     fig.update_layout(height=150, margin=dict(l=6, r=6, t=6, b=6))
-                    st.plotly_chart(fig, use_container_width=True, key=f"gauge_{tracker_id}_{course}")
+                    st.plotly_chart(fig, use_container_width=True, key=f"gauge_{tracker_id}_{course}_{user_id}")
                 else:
                     st.metric("Attendance", f"{pct:.2f}%")
 
@@ -755,13 +840,7 @@ def _duration_to_height_px(duration_min: int) -> int:
     return max(70, min(h, 190))
 
 
-def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
-    """
-    End-aligned compressed week layout:
-      - bands grouped by END time
-      - bottom-aligned blobs with duration-based height
-      - dedicated time-axis column
-    """
+def render_week_view(user_id: str, tracker_id: int, tracker_start: date, tracker_end: date):
     st.session_state.week_offset = clamp_week_offset(int(st.session_state.week_offset), tracker_start, tracker_end)
     week_start = monday_of_week(int(st.session_state.week_offset))
 
@@ -781,8 +860,9 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
 
     week_start = monday_of_week(int(st.session_state.week_offset))
 
-    ensure_sessions_for_week(tracker_id, week_start, tracker_start, tracker_end)
-    sessions = get_sessions_for_week(tracker_id, week_start)
+    # Ensure user-specific sessions exist for this week
+    ensure_sessions_for_week(user_id, tracker_id, week_start, tracker_start, tracker_end)
+    sessions = get_sessions_for_week(user_id, tracker_id, week_start)
 
     st.subheader("Week view")
     st.markdown(
@@ -810,7 +890,7 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
             }
         )
 
-    # Group by end time (bands)
+    # Group by end time (end-aligned bands)
     bands: Dict[int, Dict] = {}
     for it in normalized_sessions:
         end_min = it["end_min"]
@@ -885,10 +965,6 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
 
 
 def render_prompts_for_today(week_sessions: List[sqlite3.Row]):
-    """
-    FIX: IST-safe prompt timing
-    Streamlit Cloud uses UTC system time. We force IST to match your timetable.
-    """
     st.subheader("Today — attendance prompts")
 
     now = datetime.now(IST)
@@ -923,11 +999,15 @@ def render_prompts_for_today(week_sessions: List[sqlite3.Row]):
         st.caption("No pending prompts right now (shown after end time + buffer).")
 
 
-def sidebar_editor(tracker_id: int):
+def sidebar_editor(tracker_id: int, readonly: bool):
     classes = list_classes(tracker_id)
 
     with st.sidebar:
         st.header("Edit")
+
+        if readonly:
+            st.info("This is a GLOBAL timetable (read-only). Use Fork on landing page to edit your own copy.")
+            return
 
         st.subheader("Undo")
         if st.button("Undo last timetable change", key="undo_btn", disabled=not bool(st.session_state.undo_action)):
@@ -1015,7 +1095,7 @@ def sidebar_editor(tracker_id: int):
             st.session_state.confirm_delete_flag = False
 
         if st.session_state.confirm_clear_flag:
-            st.warning("This will delete ALL classes and ALL attendance sessions for this tracker. The tracker remains.")
+            st.warning("This will delete ALL classes and ALL attendance sessions for this tracker.")
             c1, c2 = st.columns(2)
             if c1.button("Confirm Clear", key="btn_confirm_clear", type="primary"):
                 clear_timetable(tracker_id)
@@ -1044,10 +1124,9 @@ def sidebar_editor(tracker_id: int):
                 st.session_state.confirm_delete_flag = False
 
 
-def tracker_page():
-    user_id = ensure_user_id()
+def tracker_page(user_id: str):
     tid = int(st.session_state.active_tracker)
-    t = get_tracker(tid, user_id)
+    t = get_tracker(tid)
     if not t:
         st.error("Tracker not found.")
         st.session_state.page = "home"
@@ -1056,14 +1135,17 @@ def tracker_page():
         st.rerun()
         return
 
-    # IMPORTANT: No cloning here. Cloning occurs only on Open click in home().
     tracker_start = date.fromisoformat(t["start_date"])
     tracker_end = date.fromisoformat(t["end_date"])
+    readonly = int(t["is_global"] or 0) == 1
 
     top = st.columns([6, 2])
     with top[0]:
         st.title(t["name"])
-        st.caption(f"{t['start_date']} → {t['end_date']}")
+        if readonly:
+            st.caption(f"{t['start_date']} → {t['end_date']}  ·  GLOBAL (read-only)")
+        else:
+            st.caption(f"{t['start_date']} → {t['end_date']}")
     with top[1]:
         if st.button("← Back to Landing Page", key="btn_back_home"):
             st.session_state.page = "home"
@@ -1084,11 +1166,13 @@ def tracker_page():
 
     if st.session_state.tracker_view == "summary":
         st.subheader("Course-wise attendance")
-        render_course_dashboard(tid)
+        render_course_dashboard(user_id, tid)
         return
 
-    sidebar_editor(tid)
-    week_sessions = render_week_view(tid, tracker_start, tracker_end)
+    sidebar_editor(tid, readonly=readonly)
+
+    # Ensure sessions exist for current week before anything else
+    week_sessions = render_week_view(user_id, tid, tracker_start, tracker_end)
     render_prompts_for_today(week_sessions)
 
 
@@ -1097,7 +1181,8 @@ def main():
     st.set_page_config(page_title="Attendance Trackers", layout="wide")
     inject_css()
     init_db()
-    ensure_user_id()
+
+    user_id = ensure_user()
 
     if "page" not in st.session_state:
         st.session_state.page = "home"
@@ -1115,14 +1200,15 @@ def main():
         st.session_state.confirm_delete_flag = False
 
     if st.session_state.page == "home":
-        home()
+        home(user_id)
     else:
         if st.session_state.active_tracker is None:
             st.session_state.page = "home"
             reset_tracker_view_state()
             st.rerun()
-        tracker_page()
+        tracker_page(user_id)
 
 
 if __name__ == "__main__":
     main()
+
