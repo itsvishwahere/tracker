@@ -1,33 +1,36 @@
 # attendance_app.py
 # Streamlit 1.52.2 compatible
 # Single DB: attendance.db
-# Stable version + FIX: end-aligned compressed week layout with duration-based blob height
-# Multi-user deploy: Global timetable (read-only) + per-user cloned trackers + per-user attendance sessions
-# AUTO-MIGRATION: promotes an existing local tracker to GLOBAL default named "Sem 6 - NITT EEE B"
+# FULL FEATURE VERSION (same UI/UX as your large prototype)
+# FIXES:
+#   (1) IST timezone-safe prompts (Streamlit Cloud runs UTC)
+#   (2) Clone-once-per-user guard (cloned_from + unique index)
+#   (3) Clone occurs ONLY on "Open" click, never inside tracker_page reruns
+#
+# Behavior:
+#   - One GLOBAL tracker ("Sem 6 - NITT EEE B") visible to all users
+#   - When user clicks Open on GLOBAL, they get (or reuse) their personal clone
+#   - Attendance sessions/prompts are per user (clones have fresh sessions)
 
 import sqlite3
-from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, date, timedelta, timezone
+from typing import Dict, List, Tuple, Optional
 import uuid
 
 import streamlit as st
 
 DB = "attendance.db"
 POST_CLASS_BUFFER_MIN = 5  # prompt after end time + buffer
-
 GLOBAL_DEFAULT_TRACKER_NAME = "Sem 6 - NITT EEE B"
+
+# IST (no external deps)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 DAY_TO_INT = {d: i for i, d in enumerate(DAYS)}
 
-
-# -------------------- USER ID --------------------
+# -------------------- USER ID (temporary, per browser session) --------------------
 def ensure_user_id() -> str:
-    """
-    Temporary per-user identity for Streamlit deploy:
-    - UUID per browser session.
-    - Sufficient to isolate trackers/sessions between users.
-    """
     if "user_id" not in st.session_state:
         st.session_state.user_id = str(uuid.uuid4())
     return st.session_state.user_id
@@ -45,18 +48,18 @@ def _table_has_column(c: sqlite3.Connection, table: str, col: str) -> bool:
     return any(r["name"] == col for r in rows)
 
 
-def _migrate_schema_and_seed_global():
+def init_db():
     """
-    Migration goals (no manual edits):
-    - Ensure columns trackers.user_id and trackers.is_default exist.
-    - Ensure exactly one GLOBAL default tracker exists:
-        is_default=1, user_id=NULL, name=GLOBAL_DEFAULT_TRACKER_NAME.
-    - If no default exists:
-        - If any existing tracker exists: promote the earliest tracker_id.
-        - Else: create a fresh default tracker.
+    Base schema + migrations:
+      - trackers.user_id (TEXT)         : owner for user trackers; NULL for GLOBAL
+      - trackers.is_default (INTEGER)   : 1 for GLOBAL tracker
+      - trackers.cloned_from (INTEGER)  : if user tracker is a clone of a GLOBAL tracker
+      - unique index on (user_id, cloned_from) where cloned_from not null (prevents duplicates)
+    Also:
+      - ensures exactly one GLOBAL tracker exists and is named GLOBAL_DEFAULT_TRACKER_NAME
+      - promotes existing first tracker to global if needed (your local DB migration behavior)
     """
     with conn() as c:
-        # Ensure base tables (original schema)
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS trackers (
@@ -86,13 +89,15 @@ def _migrate_schema_and_seed_global():
             """
         )
 
-        # Add new columns if missing (SQLite ALTER TABLE supports ADD COLUMN)
+        # Migrate columns
         if not _table_has_column(c, "trackers", "user_id"):
             c.execute("ALTER TABLE trackers ADD COLUMN user_id TEXT")
         if not _table_has_column(c, "trackers", "is_default"):
             c.execute("ALTER TABLE trackers ADD COLUMN is_default INTEGER DEFAULT 0")
+        if not _table_has_column(c, "trackers", "cloned_from"):
+            c.execute("ALTER TABLE trackers ADD COLUMN cloned_from INTEGER")
 
-        # If multiple defaults exist, keep the smallest tracker_id as default
+        # Prevent multiple GLOBAL defaults
         defaults = c.execute(
             "SELECT tracker_id FROM trackers WHERE is_default=1 ORDER BY tracker_id"
         ).fetchall()
@@ -100,6 +105,21 @@ def _migrate_schema_and_seed_global():
             keep = int(defaults[0]["tracker_id"])
             c.execute("UPDATE trackers SET is_default=0 WHERE is_default=1 AND tracker_id<>?", (keep,))
 
+        # Create unique index for clone guard (best-effort; partial index supported on modern SQLite)
+        try:
+            c.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_clone_per_user
+                ON trackers(user_id, cloned_from)
+                WHERE cloned_from IS NOT NULL
+                """
+            )
+        except Exception:
+            # If the environment SQLite is too old for partial indexes,
+            # we still guard at application level.
+            pass
+
+        # Ensure a GLOBAL default exists, and enforce its name and ownership = NULL
         default = c.execute(
             "SELECT * FROM trackers WHERE is_default=1 ORDER BY tracker_id LIMIT 1"
         ).fetchone()
@@ -107,50 +127,41 @@ def _migrate_schema_and_seed_global():
         if default is None:
             candidate = c.execute("SELECT * FROM trackers ORDER BY tracker_id LIMIT 1").fetchone()
             if candidate is None:
-                # Fresh install: create a blank default tracker
+                # Fresh install
                 c.execute(
                     """
-                    INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default)
-                    VALUES (?,?,?,?,?,1)
+                    INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default, cloned_from)
+                    VALUES (?,?,?,?,NULL,1,NULL)
                     """,
                     (
                         GLOBAL_DEFAULT_TRACKER_NAME,
-                        datetime.now().isoformat(timespec="seconds"),
+                        datetime.now(IST).isoformat(timespec="seconds"),
                         date.today().isoformat(),
-                        (date.today() + timedelta(days=365)).isoformat(),
-                        None,
+                        (date.today() + timedelta(days=150)).isoformat(),
                     ),
                 )
             else:
-                # Promote existing local prototype tracker to default
+                # Promote your existing local prototype tracker to GLOBAL
                 c.execute(
                     """
                     UPDATE trackers
-                    SET name=?,
-                        is_default=1,
-                        user_id=NULL
+                    SET name=?, is_default=1, user_id=NULL, cloned_from=NULL
                     WHERE tracker_id=?
                     """,
                     (GLOBAL_DEFAULT_TRACKER_NAME, int(candidate["tracker_id"])),
                 )
         else:
-            # Enforce canonical naming & unowned-ness
+            # Enforce canonical global tracker properties
             c.execute(
                 """
                 UPDATE trackers
-                SET name=?,
-                    user_id=NULL,
-                    is_default=1
+                SET name=?, is_default=1, user_id=NULL, cloned_from=NULL
                 WHERE tracker_id=?
                 """,
                 (GLOBAL_DEFAULT_TRACKER_NAME, int(default["tracker_id"])),
             )
 
         c.commit()
-
-
-def init_db():
-    _migrate_schema_and_seed_global()
 
 
 # -------------------- Helpers --------------------
@@ -227,6 +238,16 @@ def inject_css():
           .tracker-blob h4 { margin: 0 0 6px 0; font-weight: 900; }
           .tracker-meta { opacity: 0.95; font-size: 0.90rem; }
 
+          .global-badge {
+            display: inline-block;
+            margin-left: 10px;
+            padding: 2px 10px;
+            border-radius: 999px;
+            font-size: 0.74rem;
+            font-weight: 900;
+            background: rgba(255,255,255,0.22);
+          }
+
           .fab { position: fixed; right: 24px; bottom: 24px; z-index: 10000; }
           .fab a {
             display: inline-flex; align-items: center; justify-content: center;
@@ -289,16 +310,6 @@ def inject_css():
           }
 
           .range-note { opacity: 0.75; font-size: 0.90rem; }
-
-          .global-badge {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 999px;
-            font-size: 0.78rem;
-            font-weight: 800;
-            background: rgba(255,255,255,0.22);
-            margin-left: 8px;
-          }
         </style>
         """,
         unsafe_allow_html=True,
@@ -331,6 +342,9 @@ def set_query_params(**kwargs):
 
 # -------------------- Data access --------------------
 def trackers(user_id: str):
+    """
+    Return GLOBAL + user-owned trackers.
+    """
     with conn() as c:
         return c.execute(
             """
@@ -343,6 +357,9 @@ def trackers(user_id: str):
 
 
 def get_tracker(tracker_id: int, user_id: str):
+    """
+    Enforce access control: can only read GLOBAL or own trackers.
+    """
     with conn() as c:
         return c.execute(
             """
@@ -360,10 +377,10 @@ def create_tracker(name: str, start_date: date, end_date: date, user_id: str):
     with conn() as c:
         c.execute(
             """
-            INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default)
-            VALUES (?,?,?,?,?,0)
+            INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default, cloned_from)
+            VALUES (?,?,?,?,?,0,NULL)
             """,
-            (name, datetime.now().isoformat(timespec="seconds"), start_date.isoformat(), end_date.isoformat(), user_id),
+            (name, datetime.now(IST).isoformat(timespec="seconds"), start_date.isoformat(), end_date.isoformat(), user_id),
         )
 
 
@@ -418,7 +435,7 @@ def update_class(class_id: int, subject: str, day: int, start: str, end: str) ->
             (subject, day, start_n, end_n, class_id),
         )
 
-        # prevent "duplicate future schedule" bug
+        # prevent duplicate future schedule sessions
         c.execute(
             "DELETE FROM sessions WHERE class_id=? AND status='PENDING' AND session_date>=?",
             (class_id, today_iso),
@@ -565,30 +582,44 @@ def _get_default_tracker():
         return c.execute("SELECT * FROM trackers WHERE is_default=1 ORDER BY tracker_id LIMIT 1").fetchone()
 
 
-def clone_default_tracker_for_user(user_id: str) -> int:
+def get_or_create_user_clone_of_default(user_id: str) -> int:
     """
-    Clone global default tracker into a user-owned tracker.
-    Copies classes, does NOT copy sessions (fresh prompts).
+    FIX: Clone-once guard
+      - if user already has a clone of the GLOBAL tracker, reuse it
+      - else create it
     """
     default = _get_default_tracker()
     if not default:
         raise RuntimeError("Global default tracker not found.")
 
-    now = datetime.now().isoformat(timespec="seconds")
+    default_id = int(default["tracker_id"])
 
     with conn() as c:
+        existing = c.execute(
+            """
+            SELECT tracker_id FROM trackers
+            WHERE user_id=? AND cloned_from=?
+            ORDER BY tracker_id LIMIT 1
+            """,
+            (user_id, default_id),
+        ).fetchone()
+
+        if existing:
+            return int(existing["tracker_id"])
+
+        now = datetime.now(IST).isoformat(timespec="seconds")
         c.execute(
             """
-            INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default)
-            VALUES (?,?,?,?,?,0)
+            INSERT INTO trackers(name, created_at, start_date, end_date, user_id, is_default, cloned_from)
+            VALUES (?,?,?,?,?,0,?)
             """,
-            (default["name"], now, default["start_date"], default["end_date"], user_id),
+            (default["name"], now, default["start_date"], default["end_date"], user_id, default_id),
         )
-        new_tid = int(c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        new_tid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
 
         classes = c.execute(
             "SELECT subject, day_of_week, start_time, end_time FROM classes WHERE tracker_id=? ORDER BY class_id",
-            (int(default["tracker_id"]),),
+            (default_id,),
         ).fetchall()
 
         for cl in classes:
@@ -653,10 +684,9 @@ def home():
                 break
             t = ts[idx]
             idx += 1
-
             tid = int(t["tracker_id"])
             bg = stable_color(str(tid), TRACKER_PALETTE)
-            is_default = int(t["is_default"]) == 1  # sqlite3.Row safe (no .get)
+            is_default = int(t["is_default"]) == 1
 
             with cols[j]:
                 badge = "<span class='global-badge'>GLOBAL</span>" if is_default else ""
@@ -670,6 +700,10 @@ def home():
                     unsafe_allow_html=True,
                 )
                 if st.button("Open", key=f"open_{tid}"):
+                    # FIX: clone on click ONLY (not inside tracker_page reruns)
+                    if is_default:
+                        tid = get_or_create_user_clone_of_default(user_id)
+
                     st.session_state.page = "tracker"
                     st.session_state.active_tracker = tid
                     reset_tracker_view_state()
@@ -722,6 +756,12 @@ def _duration_to_height_px(duration_min: int) -> int:
 
 
 def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
+    """
+    End-aligned compressed week layout:
+      - bands grouped by END time
+      - bottom-aligned blobs with duration-based height
+      - dedicated time-axis column
+    """
     st.session_state.week_offset = clamp_week_offset(int(st.session_state.week_offset), tracker_start, tracker_end)
     week_start = monday_of_week(int(st.session_state.week_offset))
 
@@ -750,7 +790,6 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
         unsafe_allow_html=True,
     )
 
-    # Normalize times for safe grouping
     normalized_sessions = []
     for s in sessions:
         stt = normalize_time(s["start_time"])
@@ -771,17 +810,16 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
             }
         )
 
-    # Group by end time (end-aligned bands)
+    # Group by end time (bands)
     bands: Dict[int, Dict] = {}
     for it in normalized_sessions:
         end_min = it["end_min"]
         bands.setdefault(end_min, {"end_min": end_min, "end_str": it["end_str"], "items": []})
         bands[end_min]["items"].append(it)
 
-    # Sort bands by end time ascending
     band_list = sorted(bands.values(), key=lambda b: b["end_min"])
 
-    # Header row: add time axis + 7 days
+    # Header row
     header_cols = st.columns([1.2] + [1] * 7)
     header_cols[0].markdown(" ")
     for i in range(7):
@@ -794,12 +832,11 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
             unsafe_allow_html=True,
         )
 
-    # Render each band row
+    # Render each band
     for band in band_list:
         end_str = band["end_str"]
         items = band["items"]
 
-        # Compute band height = max event height within the band (for bottom-alignment container)
         max_h = 0
         for it in items:
             max_h = max(max_h, _duration_to_height_px(it["duration"]))
@@ -807,7 +844,6 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
         row_cols = st.columns([1.2] + [1] * 7)
         row_cols[0].markdown(f"<div class='time-axis'>… → {end_str}</div>", unsafe_allow_html=True)
 
-        # For each day column, bottom-align within same band height
         for day_idx in range(7):
             day_date = week_start + timedelta(days=day_idx)
             if day_date < tracker_start or day_date > tracker_end:
@@ -816,10 +852,12 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
 
             day_items = [it for it in items if it["weekday"] == day_idx]
             if not day_items:
-                row_cols[day_idx + 1].markdown(f"<div class='day-box' style='height:{max_h}px'></div>", unsafe_allow_html=True)
+                row_cols[day_idx + 1].markdown(
+                    f"<div class='day-box' style='height:{max_h}px'></div>",
+                    unsafe_allow_html=True,
+                )
                 continue
 
-            # sort by start time within the band (stable)
             day_items.sort(key=lambda it: (it["start_min"], it["duration"], it["row"]["subject"]))
 
             blocks = []
@@ -840,20 +878,20 @@ def render_week_view(tracker_id: int, tracker_start: date, tracker_end: date):
                     """
                 )
 
-            html = (
-                f"<div class='day-box band-cell' style='height:{max_h}px'>"
-                + "".join(blocks)
-                + "</div>"
-            )
+            html = f"<div class='day-box band-cell' style='height:{max_h}px'>" + "".join(blocks) + "</div>"
             row_cols[day_idx + 1].markdown(html, unsafe_allow_html=True)
 
     return sessions
 
 
 def render_prompts_for_today(week_sessions: List[sqlite3.Row]):
+    """
+    FIX: IST-safe prompt timing
+    Streamlit Cloud uses UTC system time. We force IST to match your timetable.
+    """
     st.subheader("Today — attendance prompts")
 
-    now = datetime.now()
+    now = datetime.now(IST)
     today_iso = date.today().isoformat()
     prompted = False
 
@@ -861,9 +899,9 @@ def render_prompts_for_today(week_sessions: List[sqlite3.Row]):
         if s["session_date"] != today_iso or s["status"] != "PENDING":
             continue
 
-        end_dt = datetime.combine(date.today(), datetime.strptime(s["end_time"], "%H:%M").time()) + timedelta(
-            minutes=POST_CLASS_BUFFER_MIN
-        )
+        end_time = datetime.strptime(s["end_time"], "%H:%M").time()
+        end_dt = datetime.combine(date.today(), end_time, tzinfo=IST) + timedelta(minutes=POST_CLASS_BUFFER_MIN)
+
         if now < end_dt:
             continue
 
@@ -1008,8 +1046,8 @@ def sidebar_editor(tracker_id: int):
 
 def tracker_page():
     user_id = ensure_user_id()
-    tid = st.session_state.active_tracker
-    t = get_tracker(int(tid), user_id)
+    tid = int(st.session_state.active_tracker)
+    t = get_tracker(tid, user_id)
     if not t:
         st.error("Tracker not found.")
         st.session_state.page = "home"
@@ -1018,14 +1056,7 @@ def tracker_page():
         st.rerun()
         return
 
-    # If user opened GLOBAL tracker, clone and redirect (prevents edits to global timetable)
-    if int(t["is_default"]) == 1:
-        new_tid = clone_default_tracker_for_user(user_id)
-        st.session_state.active_tracker = new_tid
-        reset_tracker_view_state()
-        st.rerun()
-        return
-
+    # IMPORTANT: No cloning here. Cloning occurs only on Open click in home().
     tracker_start = date.fromisoformat(t["start_date"])
     tracker_end = date.fromisoformat(t["end_date"])
 
@@ -1053,11 +1084,11 @@ def tracker_page():
 
     if st.session_state.tracker_view == "summary":
         st.subheader("Course-wise attendance")
-        render_course_dashboard(int(tid))
+        render_course_dashboard(tid)
         return
 
-    sidebar_editor(int(tid))
-    week_sessions = render_week_view(int(tid), tracker_start, tracker_end)
+    sidebar_editor(tid)
+    week_sessions = render_week_view(tid, tracker_start, tracker_end)
     render_prompts_for_today(week_sessions)
 
 
