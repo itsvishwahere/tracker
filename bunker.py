@@ -1191,7 +1191,7 @@ def tracker_page(user_id: str):
 
     # Ensure sessions exist for current week before anything else
     week_sessions = render_week_view(user_id, tid, tracker_start, tracker_end)
-    render_prompts_for_today(week_sessions)
+    render_prompts_for_pending(week_sessions)
 
 
 # -------------------- App --------------------
@@ -1229,5 +1229,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
